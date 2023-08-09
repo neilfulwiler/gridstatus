@@ -46,7 +46,10 @@ class TestMISO(BaseTestISO):
         Markets.DAY_AHEAD_HOURLY,
     )
     def test_get_lmp_historical(self, market):
-        with pytest.raises(NotSupported):
+        if market == Markets.REAL_TIME_5_MIN:
+            with pytest.raises(NotSupported):
+                super().test_get_lmp_historical(market)
+        else:
             super().test_get_lmp_historical(market)
 
     @with_markets(

@@ -161,21 +161,29 @@ class MISO(ISOBase):
         r = self._get_json(url, verbose=verbose)
         return r
 
-    @lmp_config(
-        supports={
-            Markets.REAL_TIME_5_MIN: ["latest"],
-            Markets.DAY_AHEAD_HOURLY: ["latest"],
-        },
-    )
-    def get_lmp(self, date, market: str, locations: list = None, verbose=False):
-        """
-        Supported Markets:
-            - ``REAL_TIME_5_MIN`` - (FiveMinLMP)
-            - ``DAY_AHEAD_HOURLY`` - (DayAheadExPostLMP)
-        """
-        if locations is None:
-            locations = "ALL"
+    def _get_lmp_day_ahead_hourly(self, date):
+        date = utils._handle_date("today" if date == "latest" else date, self.default_timezone)
 
+        csv = pd.read_csv(f'https://docs.misoenergy.org/marketreports/{date.strftime("%Y%m%d")}_da_expost_lmp.csv', skiprows=4)
+        midnight = pd.to_datetime(date).floor("d")
+        csv["Interval Start"] = [[midnight + pd.Timedelta(hours=i) for i in range(24)]] * len(csv)
+        csv["Time"] = csv["Interval Start"]
+        csv["Type"] = csv["Value"]
+        csv["Value"] = list(zip(*(csv["HE %d" % (i + 1)] for i in range(24))))
+        csv = csv.explode(column=["Interval Start", "Value"]).drop(["HE %d" % (i + 1) for i in range(24)], axis=1)
+        add_interval_end(csv, duration_min=60)
+        lmp, mcc, mlc = csv[csv["Type"] == "LMP"].copy(), csv[csv["Type"] == "MCC"].copy(), csv[csv["Type"] == "MLC"].copy()
+        lmp["LMP"] = lmp["Value"]
+        mcc["MCC"] = mcc["Value"]
+        mlc["MLC"] = mlc["Value"]
+        result = lmp\
+            .merge(mcc, on=["Node", "Interval Start"])\
+            .merge(mlc, on=["Node", "Interval Start"])\
+            .drop(["Type_x", "Value_x", "Type_y", "Value_y", "Type", "Value"], axis=1)
+        result["Location"] = result["Node"]
+        return result.sort_values("Interval Start")
+
+    def _get_lmp_realtime_5_minute(self, verbose=False):
         url = "https://api.misoenergy.org/MISORTWDDataBroker/DataBrokerServices.asmx?messageType=getLMPConsolidatedTable&returnType=json"  # noqa
         r = self._get_json(url, verbose=verbose)
 
@@ -189,17 +197,31 @@ class MISO(ISOBase):
             )
             .tz_convert(self.default_timezone)
         )
+        data = pd.DataFrame(r["LMPData"]["FiveMinLMP"]["PricingNode"])
+        data["Interval Start"] = interval_start
+        data = add_interval_end(data, 5)
+        return data
 
-        if market == Markets.REAL_TIME_5_MIN:
-            data = pd.DataFrame(r["LMPData"]["FiveMinLMP"]["PricingNode"])
-            interval_duration = 5
-        elif market == Markets.DAY_AHEAD_HOURLY:
-            data = pd.DataFrame(
-                r["LMPData"]["DayAheadExPostLMP"]["PricingNode"],
-            )
-            interval_start = interval_start.floor("H")
-            interval_duration = 60
+    @lmp_config(
+        supports={
+            Markets.REAL_TIME_5_MIN: ["latest"],
+            Markets.DAY_AHEAD_HOURLY: ["latest", "historical"],
+        },
+    )
+    def get_lmp(self, date, market: str, locations: list = None, verbose=False):
+        """
+        Supported Markets:
+            - ``REAL_TIME_5_MIN`` - (FiveMinLMP)
+            - ``DAY_AHEAD_HOURLY`` - (DayAheadExPostLMP)
+        """
+        if locations is None:
+            locations = "ALL"
 
+        if market == Markets.DAY_AHEAD_HOURLY:
+            data = self._get_lmp_day_ahead_hourly(date)
+        else:
+            data = self._get_lmp_realtime_5_minute(verbose)
+            
         rename = {
             "name": "Location",
             "LMP": "LMP",
@@ -215,8 +237,6 @@ class MISO(ISOBase):
         )
 
         data["Energy"] = data["LMP"] - data["Loss"] - data["Congestion"]
-        data["Interval Start"] = interval_start
-        data = add_interval_end(data, interval_duration)
         data["Market"] = market.value
         data["Location Type"] = "Pricing Node"
         data.loc[
